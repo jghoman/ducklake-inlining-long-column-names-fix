@@ -106,7 +106,7 @@ When a column is renamed via `ALTER TABLE ... RENAME COLUMN`:
 
 ### Parquet compatibility
 
-Parquet files written after the fixup use the truncated column name. DuckLake resolves parquet columns by `column_id`, not by name, so existing parquet files (which could only have been written before the column exceeded 63 bytes, since the bug blocks flush) continue to read correctly.
+Parquet files written after the fixup use the truncated column name. DuckLake resolves parquet columns by `field_id` (numeric `column_id`), not by name — confirmed by `MultiFileColumnMappingMode::BY_FIELD_ID` in the source. Existing parquet files (which could only have been written before the column exceeded 63 bytes, since the bug blocks flush) continue to read correctly.
 
 ## File Inventory
 
@@ -129,6 +129,43 @@ Parquet files written after the fixup use the truncated column name. DuckLake re
 | `test-fixup.sql` | Basic fixup → query → flush → query cycle |
 | `verify-fixup.sql` | Minimal post-fixup smoke test |
 | `schema-evolution-test.sql` | How DuckLake handles column renames with inlined data |
+
+## Source Code Verification
+
+The fixup was verified against the [DuckLake source code](https://github.com/duckdb/ducklake) to confirm safety. The full bug path in the source:
+
+1. **Catalog load** — `column_name` read from `ducklake_column` into `DuckLakeColumnInfo.name` (`ducklake_metadata_manager.cpp:611`)
+2. **Field data** — flows unchanged to `DuckLakeFieldId.name` → `MultiFileColumnDefinition.name` (`ducklake_catalog.cpp:360`)
+3. **SELECT generation** — `KeywordHelper::WriteOptionallyQuoted(columns[index].name)` uses the full untruncated name (`ducklake_inlined_data_reader.cpp:71`)
+4. **Table creation** — `SQLIdentifier(col.name)` generates the CREATE TABLE DDL, which Postgres truncates (`ducklake_metadata_manager.cpp:2105`)
+
+### What uses `column_name`
+
+| Code path | Uses `column_name`? | Safe to truncate? |
+|---|---|---|
+| Inlined data CREATE TABLE DDL | Yes — as PG identifier | Yes — already truncated by PG |
+| Inlined data SELECT projection | Yes — source column ref | Yes — this is the bug we're fixing |
+| Inlined data INSERT | No — positional VALUES | N/A |
+| Parquet reads | No — uses `BY_FIELD_ID` (numeric) | N/A |
+| Name maps / column mappings | No — uses `target_field_id` | N/A |
+| Stats, deletions, partitions | No — keyed by `FieldIndex` | N/A |
+| Schema APIs (DESCRIBE, etc.) | Yes — cosmetic display | Yes — shows truncated name |
+| Struct field names in types | No — inside `STRUCT(...)` type def, not PG identifiers | N/A |
+
+### Key source code locations
+
+| File | Function | Line | Role |
+|---|---|---|---|
+| `ducklake_metadata_manager.cpp` | `GetInlinedTableQuery` | 2098-2110 | CREATE TABLE DDL for inlined data tables |
+| `ducklake_inlined_data_reader.cpp` | `TryInitializeScan` | 71 | SELECT projection — where the bug manifests |
+| `ducklake_metadata_manager.cpp` | `GetProjection` | 2621-2633 | Aliases columns as `col1, col2, ...` for output (but source ref uses full name) |
+| `ducklake_metadata_manager.cpp` | `ReadInlinedData` | 2635-2646 | Executes the SELECT against PG |
+| `ducklake_metadata_manager.cpp` | `WriteNewInlinedData` | 2295-2412 | INSERT (positional, no column names) |
+| `ducklake_multi_file_reader.cpp` | `FinalizeBind` | 214 | Sets `BY_FIELD_ID` mapping for parquet |
+
+### Interesting finding
+
+`GetProjection()` already aliases inlined data columns as `col1, col2, ...` in the SELECT output. The aliasing infrastructure is already there — the bug is only that the **source** column reference uses the human-readable name instead of a stable identifier. This supports the "use `col_N` everywhere" proposal below.
 
 ## A Better Fix: Stop Using Column Names in Inlined Tables
 
@@ -159,6 +196,8 @@ This would:
 - **Work across catalog backends** — Postgres, MySQL, SQLite all have different identifier length limits; `col_N` fits all of them
 
 The tradeoff is debuggability when inspecting the backing Postgres directly, but that's what the catalog is for. The current design stores the column name in two places (catalog metadata AND Postgres DDL identifiers) and has to keep them in sync across a system boundary with different constraints. Classic denormalization bug.
+
+## File Inventory (continued)
 
 ### Investigation
 
