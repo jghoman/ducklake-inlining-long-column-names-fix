@@ -1,0 +1,44 @@
+name: ducklake-v03
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ducklake
+      POSTGRES_PASSWORD: ducklake
+      POSTGRES_DB: ducklake
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg-data-v03:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ducklake"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+
+  duckdb:
+    image: duckdb/duckdb:1.4.4
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./repro.sql:/repro.sql
+      - ./workaround.sql:/workaround.sql
+      - ./schema-evolution-test.sql:/schema-evolution-test.sql
+      - ./inspect.sql:/inspect.sql
+      - ./fixup.sql:/fixup.sql
+      - ./test-fixup.sql:/test-fixup.sql
+      - ./inspect-schema-evo.sql:/inspect-schema-evo.sql
+      - ./evo-repro.sql:/evo-repro.sql
+      - ./inspect2.sql:/inspect2.sql
+      - ./inspect-refs.sql:/inspect-refs.sql
+      - ./verify-fixup.sql:/verify-fixup.sql
+      - ./test-multi-table.sql:/test-multi-table.sql
+      - ./test-parquet-compat.sql:/test-parquet-compat.sql
+      - duckdb-data-v03:/data
+    entrypoint: ["duckdb", "-no-stdin", "-init", "/repro.sql"]
+
+volumes:
+  pg-data-v03:
+  duckdb-data-v03:

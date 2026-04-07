@@ -1,0 +1,33 @@
+name: ducklake-v04
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ducklake
+      POSTGRES_PASSWORD: ducklake
+      POSTGRES_DB: ducklake
+    ports:
+      - "5433:5432"
+    volumes:
+      - pg-data-v04:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ducklake"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+
+  duckdb:
+    image: duckdb/duckdb:1.5.1
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./repro.sql:/repro.sql
+      - ./workaround.sql:/workaround.sql
+      - duckdb-data-v04:/data
+    entrypoint: ["duckdb", "-no-stdin", "-init", "/repro.sql"]
+
+volumes:
+  pg-data-v04:
+  duckdb-data-v04:
