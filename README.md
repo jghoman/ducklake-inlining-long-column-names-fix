@@ -197,6 +197,88 @@ This would:
 
 The tradeoff is debuggability when inspecting the backing Postgres directly, but that's what the catalog is for. The current design stores the column name in two places (catalog metadata AND Postgres DDL identifiers) and has to keep them in sync across a system boundary with different constraints. Classic denormalization bug.
 
+### What the queries look like today vs with `col_N`
+
+Given a table with columns `id INTEGER` (column_id=1) and `this_is_a_very_long_column_name_that_exceeds_sixty_four_characters_limit VARCHAR` (column_id=2):
+
+**CREATE TABLE — current (Postgres silently truncates the column name):**
+```sql
+CREATE TABLE IF NOT EXISTS "public"."ducklake_inlined_data_1_1"(
+    row_id BIGINT, begin_snapshot BIGINT, end_snapshot BIGINT,
+    "id" INTEGER,
+    "this_is_a_very_long_column_name_that_exceeds_sixty_four_characters_limit" VARCHAR
+);
+```
+
+**CREATE TABLE — with `col_N` (no truncation possible):**
+```sql
+CREATE TABLE IF NOT EXISTS "public"."ducklake_inlined_data_1_1"(
+    row_id BIGINT, begin_snapshot BIGINT, end_snapshot BIGINT,
+    col_1 INTEGER,
+    col_2 VARCHAR
+);
+```
+
+**INSERT — unchanged (already positional):**
+```sql
+INSERT INTO "public"."ducklake_inlined_data_1_1"
+VALUES (1, 5, NULL, 1, 'row 1');
+```
+
+**ReadInlinedData (table scan) — current (breaks):**
+```sql
+SELECT "id"::INTEGER AS col1,
+       "this_is_a_very_long_column_name_that_exceeds_sixty_four_characters_limit"::VARCHAR AS col2
+FROM "public"."ducklake_inlined_data_1_1" inlined_data
+WHERE 5 >= begin_snapshot AND (5 < end_snapshot OR end_snapshot IS NULL)
+ORDER BY row_id;
+-- ❌ Binder Error: column not found
+```
+
+**ReadInlinedData — with `col_N`:**
+```sql
+SELECT col_1::INTEGER AS col1, col_2::VARCHAR AS col2
+FROM "public"."ducklake_inlined_data_1_1" inlined_data
+WHERE 5 >= begin_snapshot AND (5 < end_snapshot OR end_snapshot IS NULL)
+ORDER BY row_id;
+```
+
+**ReadInlinedDataInsertions — with `col_N`:**
+```sql
+SELECT col_1::INTEGER AS col1, col_2::VARCHAR AS col2
+FROM "public"."ducklake_inlined_data_1_1" inlined_data
+WHERE inlined_data.begin_snapshot >= 3 AND inlined_data.begin_snapshot <= 5;
+```
+
+**ReadInlinedDataDeletions — with `col_N`:**
+```sql
+SELECT col_1::INTEGER AS col1, col_2::VARCHAR AS col2
+FROM "public"."ducklake_inlined_data_1_1" inlined_data
+WHERE inlined_data.end_snapshot >= 3 AND inlined_data.end_snapshot <= 5;
+```
+
+**ReadAllInlinedDataForFlush — with `col_N`:**
+```sql
+SELECT col_1::INTEGER AS col1, col_2::VARCHAR AS col2
+FROM "public"."ducklake_inlined_data_1_1" inlined_data
+WHERE 5 >= begin_snapshot
+ORDER BY row_id, begin_snapshot;
+```
+
+### Code changes required
+
+The diff would be small — two functions:
+
+| Function | File | Line | Change |
+|---|---|---|---|
+| `GetInlinedTableQuery` | `ducklake_metadata_manager.cpp` | 2105 | `SQLIdentifier(col.name)` → `StringUtil::Format("col_%d", col.id.index)` |
+| `TryInitializeScan` | `ducklake_inlined_data_reader.cpp` | 71 | `WriteOptionallyQuoted(columns[index].name)` → `StringUtil::Format("col_%d", field_id_value)` using `columns[index].identifier` (already available as the numeric `column_id`) |
+
+Everything else is unchanged:
+- `GetProjection` and the four `Read*` functions work with whatever strings are in `columns_to_read`
+- INSERT is already positional
+- Column renames no longer require a new inlined data table — the physical column names (`col_1`, `col_2`) don't change, only the catalog mapping does
+
 ## File Inventory (continued)
 
 ### Investigation
